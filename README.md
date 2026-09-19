@@ -1,1 +1,5 @@
-TEENSY 4.1 Drum Sampler + 4 Trakcs
+# Lud-WS-Teensy
+
+TEENSY 4.1 
+Samplers Drum + FX
+4 audio Trakcs
