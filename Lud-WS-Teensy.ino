@@ -6,7 +6,7 @@
 //   - Motore audio completo (Teensy Audio Library + SerialFlash + SD)
 //     dal progetto LudTeensyDrumT41_06.ino
 //   - Protocollo LWS v1.1 (serial_protocol.h + comunicazioni_mcu.h)
-//   - Mappa completa comandi LWS (27 key) + echo bidirezionale
+//   - Mappa completa comandi LWS (27 key) + echo bidirezionale  
 //   - Pin remap: LWS su Serial3 (TX=14, RX=15) per liberare Serial2
 //     (pin 7,8) usato dal secondo codec I2S di AudioOutputI2SQuad
 //
