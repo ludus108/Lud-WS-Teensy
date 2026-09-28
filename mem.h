@@ -1,5 +1,5 @@
 const float levArr[21] = {0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0};
-byte seqArr[16][8][32];
+byte seqArr[16][9][32];
 const float resArr[21] = {0.0, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0};
 const int cutArr[21] = {80, 200, 300, 400, 500, 600, 700, 800, 1000, 1250, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000, 5500, 6000, 8000};
 
@@ -275,39 +275,131 @@ void scriviSd() {
     //do some action here
     } */
 }
+
+// =====================================================================
+// SD PATTERN — lettura
+// ---------------------------------------------------------------------
+// File PTNxx.TXT: una riga per voce, valori separati da virgola.
+//
+// FORMATO NUOVO (9 righe):
+//   0=BD  1=SD  2=HH  3=OH  4=HH2  5=CLAP  6=PERC1  7=PERC2  8=PERC3
+//   Valori: 0=silenzio, 1..3=velocity soft/medium/accent
+//
+// FORMATO STORICO (8 righe, riga 2 HH ingloba anche open):
+//   0=BD  1=SD  2=HH(closed+open)  3=HH2  4=CLAP  5=PERC1  6=PERC2  7=PERC3
+//   Riga 2 valori: 1=closed, 2=open (la 3 era ignorata dal vecchio codice)
+//
+// La conversione avviene in lettura:
+//   - shift delle righe 3..7 verso 4..8 (per far posto a OH in posizione 3)
+//   - split della vecchia riga HH:
+//         valore 1  -> nuova HH (riga 2) = 1   (closed soft)
+//         valore 2  -> nuova OH (riga 3) = 1   (open soft)
+//         altri     -> silenzio
+// =====================================================================
 void leggiSd() {
   String bufferT, filename;
-  char filenameCA[10] ;
-  int strIndex[] = {0, -1};
-  int maxIndex;
-  int indexArr = 0, indexF = 0;
+  char filenameCA[10];
+  String lines[12];                 // buffer righe grezze (max 12, capienza ampia)
+  int nRows;
+  int strIndex[2];
+  int maxIndex, indexArr;
   String charTemp;
-  for (int w = 0; w < 16; w++) {
 
-    indexF = 0;
+  // Mappa riga-file -> riga-seqArr per il formato storico a 8 righe.
+  // Converte l'ordine:  BD SD HH HH2 CLAP P1 P2 P3
+  //                 in:  BD SD HH OH  HH2 CLAP P1 P2 P3
+  static const uint8_t rowMapOld8[8] = {0, 1, 2, 4, 5, 6, 7, 8};
+
+  for (int w = 0; w < 16; w++) {
+    // Azzera il pattern: se il file manca o è vuoto, resta silenzio.
+    memset(seqArr[w], 0, sizeof(seqArr[w]));
+
     filename = "PTN" + (String)w + ".TXT";
     filename.toCharArray(filenameCA, 10);
     myFile = SD.open(filenameCA);
-    while (myFile.available()) {
+    if (!myFile) {
+      // File assente: pattern vuoto, si prosegue
+      continue;
+    }
+
+    // -----------------------------------------------------------------
+    // 1) Legge tutte le righe in memoria per contare quante ce ne sono.
+    //    (determina se il file è nuovo a 9 righe o storico a 8)
+    // -----------------------------------------------------------------
+    nRows = 0;
+    while (myFile.available() && nRows < 12) {
       bufferT = myFile.readStringUntil('\n');
-      // Serial.println(bufferT); //Printing for debugging purpose
+      bufferT.trim();                        // rimuove \r e spazi
+      if (bufferT.length() > 0) {
+        lines[nRows++] = bufferT;
+      }
+    }
+    myFile.close();
+
+    // File vuoto o malformato: lascia il pattern a zero
+    if (nRows == 0) continue;
+
+    // Rilevamento formato: <=8 righe = storico, >=9 = nuovo
+    bool old8 = (nRows <= 8);
+
+    // -----------------------------------------------------------------
+    // 2) Parsing riga per riga, applicando lo shift se necessario.
+    // -----------------------------------------------------------------
+    for (int r = 0; r < nRows; r++) {
+
+      // Determina la riga di destinazione in seqArr
+      int dstRow;
+      if (old8) {
+        dstRow = (r < 8) ? (int)rowMapOld8[r] : -1;
+      } else {
+        dstRow = r;
+      }
+      if (dstRow < 0 || dstRow >= 9) continue;
+
+      // Parsing della riga r: valori separati da virgola
+      bufferT = lines[r];
       strIndex[0] = 0;
       strIndex[1] = -1;
       maxIndex = bufferT.length() - 1;
       indexArr = 0;
-      for (int i = 0; i <= maxIndex; i++) {
+
+      for (int i = 0; i <= maxIndex && indexArr < 32; i++) {
         if (bufferT.charAt(i) == ',' || i == maxIndex) {
           strIndex[0] = strIndex[1] + 1;
           strIndex[1] = (i == maxIndex) ? i + 1 : i;
           charTemp = bufferT.substring(strIndex[0], strIndex[1]);
-          seqArr[w][indexF][indexArr] = charTemp.toInt();
+
+          int val = charTemp.toInt();
+
+          if (old8 && r == 2) {
+            // -------------------------------------------------------
+            // Riga HH storica: split in HH (closed) + OH (open)
+            //   1 → closed soft  su seqArr[2]
+            //   2 → open   soft  su seqArr[3]
+            //   0, altri → silenzio (il vecchio 3 non faceva nulla)
+            // -------------------------------------------------------
+            if (val == 1) {
+              seqArr[w][2][indexArr] = 1;
+            } else if (val == 2) {
+              seqArr[w][3][indexArr] = 1;
+            }
+            // val == 0 o altro: entrambe le righe restano 0 (già azzerate)
+          } else {
+            // -------------------------------------------------------
+            // Riga normale: copia diretta con clamp di sicurezza 0..3
+            // -------------------------------------------------------
+            if (val < 0) val = 0;
+            if (val > 3) val = 3;
+            seqArr[w][dstRow][indexArr] = (byte)val;
+          }
+
           indexArr++;
         }
       }
-      indexF++;
     }
   }
 }
+
 void scriviEeprom() {
   preSalva = 0;
   unsigned int addr = 20;
