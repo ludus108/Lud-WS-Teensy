@@ -1,13 +1,14 @@
 // =====================================================================
 // Lud-WS-Teensy -- Teensy 4.1 drum sampler + sequencer + LWS node
 // ---------------------------------------------------------------------
-//   				V 0.1.10 (2026-09-28) — tre livelli di velocity su tutte le voci drum,
-
-//                      ultima modifica:
- /* 
- HH/OH con player, amp ed envelope separati,
-                      seqArr esteso a 9 righe (OH in posizione 3). 
- */
+// V 0.1.10
+// REV 12 (2026-09-28) — rimossa la parte MIDI hardware (Serial6).
+//                       Il Teensy comunica solo via LWS col Router.
+//                       I callback LWS on_cc/on_note/on_bend restano
+//                       attivi per ricevere CMD_MIDI_* dal Router.
+// REV 11 (2026-09-28) — pattern drum su SD in formato binario .BIN
+//                       (293 byte/file, header + payload + CRC-8).
+//                       Rimossi parsing CSV e shim di compatibilità.
 //
 //   - Motore audio completo (Teensy Audio Library + SerialFlash + SD)
 //   - Protocollo LWS v1.1 (serial_protocol.h + comunicazioni_mcu.h)
@@ -27,6 +28,14 @@
 // Codifica celle:
 //   0     = silenzio
 //   1..3  = velocity soft / medium / accent
+//
+// Formato file pattern (PTN00.BIN .. PTN15.BIN):
+//   [0]      magic  'P'  (0x50)
+//   [1]      version     0x01
+//   [2]      num_rows    9
+//   [3]      num_cols    32
+//   [4..291] payload     288 byte row-major
+//   [292]    crc8_atm    poly 0x07, init 0x00
 //
 // LWS:
 //   MCU_ID='T', Serial3 @ 1 Mbps (TX=14, RX=15)
@@ -50,8 +59,6 @@
 // Librerie audio / storage
 // ---------------------------------------------------------------------
 #include <Audio.h>
-#include <Wire.h>
-#include <MIDI.h>
 #include <SPI.h>
 #include <SD.h>
 #include <SerialFlash.h>
@@ -71,8 +78,7 @@
 // AUDIO GRAPH
 // ---------------------------------------------------------------------
 // Ogni voce drum passa per un AudioAmplifier dedicato, così ogni
-// colpo può avere uno dei tre livelli di velocity (soft/medium/accent)
-// senza agire sui mixer globali.
+// colpo può avere uno dei tre livelli di velocity (soft/medium/accent).
 //
 // HH e OH hanno player, amp ed envelope separati:
 //   soundHhC -> ampHh -> envHh -\
@@ -199,11 +205,6 @@ AudioConnection o1(mixOutRev, 0, outQuad, 0);   // Rev L (SGTL5000 #1)
 AudioConnection o2(mixOutDly, 0, outQuad, 1);   // Dly R
 AudioConnection o3(mixOutL, 0, outQuad, 2);     // PCM L (SGTL5000 #2)
 AudioConnection o4(mixOutR, 0, outQuad, 3);     // PCM R
-
-// =====================================================================
-// MIDI IN (opzionale, Serial6 = TX24/RX25)
-// =====================================================================
-MIDI_CREATE_INSTANCE(HardwareSerial, Serial6, MIDIext);
 
 // =====================================================================
 // COSTANTI TRACCE
@@ -361,94 +362,128 @@ void getTempoTrack(int num) {
 }
 
 // =====================================================================
-// SD PATTERN (leggiSd / scriviSd)
+// SD PATTERN — formato binario .BIN
 // ---------------------------------------------------------------------
-// File PTNxx.TXT: 9 righe, una per voce, 32 valori separati da virgola.
-// Layout righe:
-//   0=BD 1=SD 2=HH 3=OH 4=HH2 5=CLAP 6=PERC1 7=PERC2 8=PERC3
+// File: PTN00.BIN .. PTN15.BIN (293 byte ciascuno)
+//   [0]      magic  'P'  (0x50)
+//   [1]      version     0x01
+//   [2]      num_rows    9
+//   [3]      num_cols    32
+//   [4..291] payload     9*32 = 288 byte, row-major
+//   [292]    crc8_atm    poly 0x07, init 0x00
 //
-// Compatibilità: se il file ha solo 8 righe (formato storico con OH
-// dentro HH), la riga OH resta 0 e i valori 4..6 eventualmente presenti
-// sulla riga HH vengono tradotti in velocity 1..3 sulla riga OH.
+// Layout righe del payload:
+//   0=BD 1=SD 2=HH 3=OH 4=HH2 5=CLAP 6=PERC1 7=PERC2 8=PERC3
+// Valori 0..3 (0=silenzio, 1..3=velocity soft/medium/accent)
 // =====================================================================
 
-void leggiSd() {
-  String bufferT, filename;
-  char filenameCA[10];
-  int strIndex[2];
-  int maxIndex, indexArr, indexF;
-  String charTemp;
+static const uint8_t PTN_MAGIC   = 0x50;   // 'P'
+static const uint8_t PTN_VERSION = 0x01;
+static const uint8_t PTN_ROWS    = 9;
+static const uint8_t PTN_COLS    = 32;
+static const size_t  PTN_HDR     = 4;
+static const size_t  PTN_PAYLOAD = PTN_ROWS * PTN_COLS;      // 288
+static const size_t  PTN_TOTAL   = PTN_HDR + PTN_PAYLOAD + 1; // 293
 
-  for (int w = 0; w < 16; w++) {
-    indexF = 0;
-    filename = "PTN" + (String)w + ".TXT";
-    filename.toCharArray(filenameCA, 10);
-    myFile = SD.open(filenameCA);
-
-    if (!myFile) {
-      // File assente: azzera pattern per sicurezza
-      memset(seqArr[w], 0, sizeof(seqArr[w]));
-      continue;
+// CRC-8/ATM (poly 0x07, init 0x00), coerente con serial_protocol.h
+static uint8_t crc8_atm(const uint8_t *data, size_t len) {
+  uint8_t crc = 0x00;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (uint8_t b = 0; b < 8; b++) {
+      crc = (crc & 0x80) ? ((crc << 1) ^ 0x07) : (crc << 1);
     }
-
-    while (myFile.available()) {
-      bufferT = myFile.readStringUntil('\n');
-      strIndex[0] = 0;
-      strIndex[1] = -1;
-      maxIndex = bufferT.length() - 1;
-      indexArr = 0;
-
-      for (int i = 0; i <= maxIndex; i++) {
-        if (bufferT.charAt(i) == ',' || i == maxIndex) {
-          strIndex[0] = strIndex[1] + 1;
-          strIndex[1] = (i == maxIndex) ? i + 1 : i;
-          charTemp = bufferT.substring(strIndex[0], strIndex[1]);
-
-          int val = charTemp.toInt();
-          if (indexF < 9 && indexArr < 32) {
-            seqArr[w][indexF][indexArr] = (byte)val;
-
-            // Shim compatibilità: vecchi open (4..6) dentro HH
-            if (indexF == 2 && val >= 4 && val <= 6) {
-              seqArr[w][3][indexArr] = (byte)(val - 3);   // OH = 1..3
-              seqArr[w][2][indexArr] = 0;                 // HH azzerato
-            } else if (indexF == 2 && val > 3) {
-              seqArr[w][2][indexArr] = 3;                 // clamp di sicurezza
-            }
-          }
-          indexArr++;
-        }
-      }
-      indexF++;
-      if (indexF >= 9) break;   // oltre 9 righe: ignora il resto
-    }
-    myFile.close();
   }
+  return crc;
 }
 
-void scriviSd() {
-  String filename;
-  char filenameCA[10];
-  String txtOut = "";
-  String suffTxt = "";
+// Legge PTNxx.BIN in seqArr[w]. Ritorna true se ok.
+// In caso di errore lascia seqArr[w] invariato (il chiamante ha già azzerato).
+static bool leggiPtnBin(int w) {
+  char fname[13];
+  snprintf(fname, sizeof(fname), "PTN%02d.BIN", w);
 
-  for (int w = 0; w < 16; w++) {
-    filename = "PTN" + (String)w + ".TXT";
-    filename.toCharArray(filenameCA, 10);
-    SD.remove(filenameCA);
-    myFile = SD.open(filenameCA, FILE_WRITE);
+  File f = SD.open(fname, FILE_READ);
+  if (!f) return false;
 
-    for (int y = 0; y < 9; y++) {
-      for (int i = 0; i < 32; i++) {
-        suffTxt = (i == 31) ? "" : ",";
-        txtOut += (String)seqArr[w][y][i] + suffTxt;
-      }
-      myFile.println(txtOut);
-      txtOut = "";
-    }
-    myFile.close();
-    delay(10);
+  if (f.size() != PTN_TOTAL) {
+    LWS_DEBUG.printf("[SD] %s: dimensione errata (%lu, attesa %u)\n",
+                     fname, (unsigned long)f.size(), (unsigned)PTN_TOTAL);
+    f.close();
+    return false;
   }
+
+  uint8_t buf[PTN_TOTAL];
+  if (f.read(buf, PTN_TOTAL) != (int)PTN_TOTAL) {
+    f.close();
+    return false;
+  }
+  f.close();
+
+  // Header
+  if (buf[0] != PTN_MAGIC ||
+      buf[1] != PTN_VERSION ||
+      buf[2] != PTN_ROWS ||
+      buf[3] != PTN_COLS) {
+    LWS_DEBUG.printf("[SD] %s: header non valido\n", fname);
+    return false;
+  }
+
+  // CRC su header+payload (byte 0..291)
+  uint8_t crc_calc = crc8_atm(buf, PTN_TOTAL - 1);
+  if (crc_calc != buf[PTN_TOTAL - 1]) {
+    LWS_DEBUG.printf("[SD] %s: CRC errato (calc=%02X file=%02X)\n",
+                     fname, crc_calc, buf[PTN_TOTAL - 1]);
+    return false;
+  }
+
+  memcpy(&seqArr[w][0][0], buf + PTN_HDR, PTN_PAYLOAD);
+  return true;
+}
+
+// Scrive seqArr[w] in PTNxx.BIN. Ritorna true se ok.
+static bool scriviPtnBin(int w) {
+  uint8_t buf[PTN_TOTAL];
+
+  buf[0] = PTN_MAGIC;
+  buf[1] = PTN_VERSION;
+  buf[2] = PTN_ROWS;
+  buf[3] = PTN_COLS;
+  memcpy(buf + PTN_HDR, &seqArr[w][0][0], PTN_PAYLOAD);
+  buf[PTN_TOTAL - 1] = crc8_atm(buf, PTN_TOTAL - 1);
+
+  char fname[13];
+  snprintf(fname, sizeof(fname), "PTN%02d.BIN", w);
+
+  SD.remove(fname);
+  File f = SD.open(fname, FILE_WRITE);
+  if (!f) return false;
+  size_t written = f.write(buf, PTN_TOTAL);
+  f.close();
+  return (written == PTN_TOTAL);
+}
+
+// Carica tutti i 16 pattern. Un file mancante o invalido lascia
+// il pattern corrispondente a zero.
+void leggiSd() {
+  memset(seqArr, 0, sizeof(seqArr));
+
+  int ok = 0;
+  for (int w = 0; w < 16; w++) {
+    if (leggiPtnBin(w)) ok++;
+  }
+  LWS_DEBUG.printf("[SD] pattern caricati: %d/16\n", ok);
+}
+
+// Riscrive tutti i 16 pattern come .BIN.
+void scriviSd() {
+  int ok = 0;
+  for (int w = 0; w < 16; w++) {
+    if (scriviPtnBin(w)) ok++;
+    else LWS_DEBUG.printf("[SD] scrittura PTN%02d.BIN fallita\n", w);
+    delay(5);   // lascia respirare la SD
+  }
+  LWS_DEBUG.printf("[SD] pattern scritti: %d/16\n", ok);
 }
 
 // =====================================================================
@@ -862,21 +897,6 @@ void on_bend(int32_t b) {
   LWS_DEBUG.printf("[LWS] BEND %ld\n", (long)b);
 }
 
-// =====================================================================
-// MIDI IN callbacks
-// =====================================================================
-void handleNoteOn(byte ch, byte pitch, byte vel) {
-  LWS_DEBUG.printf("[MIDI] NoteOn ch=%u p=%u v=%u\n", ch, pitch, vel);
-}
-void handleNoteOff(byte ch, byte pitch, byte vel) {
-  LWS_DEBUG.printf("[MIDI] NoteOff ch=%u p=%u\n", ch, pitch);
-}
-void handleCC(byte ch, byte num, byte val) {
-  LWS_DEBUG.printf("[MIDI] CC ch=%u n=%u v=%u\n", ch, num, val);
-}
-void handlePB(byte ch, int bend) {
-  LWS_DEBUG.printf("[MIDI] PB ch=%u b=%d\n", ch, bend);
-}
 
 // =====================================================================
 // DUMP STATO
@@ -913,7 +933,7 @@ void dumpStatus() {
 // =====================================================================
 void setup() {
   LWS_DEBUG.begin(115200);
-  LWS_DEBUG.println("=== Lud-WS-Teensy boot (rev10, sampler+LWS+3vel) ===");
+  LWS_DEBUG.println("=== Lud-WS-Teensy boot (rev11, sampler+LWS+3vel+BIN) ===");
   LWS_DEBUG.printf("MCU_ID='%c' LWS_BAUD=%lu\n", MCU_ID, (unsigned long)LWS_BAUD);
 
   LWS_SERIAL.begin(LWS_BAUD);           // Serial3 @ 1 Mbps (TX=14, RX=15)
@@ -921,16 +941,8 @@ void setup() {
   lws_set_callbacks(on_param, on_error);
   lws_set_midi_callbacks(on_cc, on_note, on_bend);
 
-  // MIDI IN (opzionale, Serial6)
-  MIDIext.begin(MIDI_CHANNEL_OMNI);
-  MIDIext.turnThruOff();
-  MIDIext.setHandleNoteOn(handleNoteOn);
-  MIDIext.setHandleNoteOff(handleNoteOff);
-  MIDIext.setHandleControlChange(handleCC);
-  MIDIext.setHandlePitchBend(handlePB);
-
   // Audio
-  AudioMemory(260);                     // aumentato per i nuovi amp+env
+  AudioMemory(260);
   audioCtrl1.enable(); audioCtrl1.volume(0.7);
   audioCtrl2.enable(); audioCtrl2.volume(0.7);
 
@@ -941,7 +953,7 @@ void setup() {
     LWS_DEBUG.println("SerialFlash OK");
   }
 
-  // SD (tracce WAV + pattern TXT)
+  // SD (tracce WAV + pattern BIN)
   if (!SD.begin(SD_CS)) {
     LWS_DEBUG.println("SD FAILED");
   } else {
@@ -1024,9 +1036,6 @@ void setup() {
 void loop() {
   // LWS
   lws_mcu_poll();
-
-  // MIDI
-  MIDIext.read();
 
   // Sequencer interno
   if (msecs > seqTime && seqRunning == 1 && sync == 0) {
