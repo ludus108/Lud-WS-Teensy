@@ -1,45 +1,39 @@
 // =====================================================================
 // Lud-WS-Teensy -- Teensy 4.1 drum sampler + sequencer + LWS node
 // ---------------------------------------------------------------------
-// V 0.1.10
-// REV 12 (2026-09-28) — rimossa la parte MIDI hardware (Serial6).
-//                       Il Teensy comunica solo via LWS col Router.
-//                       I callback LWS on_cc/on_note/on_bend restano
-//                       attivi per ricevere CMD_MIDI_* dal Router.
-// REV 11 (2026-09-28) — pattern drum su SD in formato binario .BIN
-//                       (293 byte/file, header + payload + CRC-8).
-//                       Rimossi parsing CSV e shim di compatibilità.
-//
-//   - Motore audio completo (Teensy Audio Library + SerialFlash + SD)
-//   - Protocollo LWS v1.1 (serial_protocol.h + comunicazioni_mcu.h)
-//   - Mappa completa comandi LWS + echo bidirezionale
-//   - Pin remap: LWS su Serial3 (TX=14, RX=15) per liberare Serial2
-//     (pin 7,8) usato dal secondo codec I2S di AudioOutputI2SQuad
+// REV 0.1.12 (2026-09-28)
+//   - Rimossa la parte MIDI hardware (Serial6 TX24/RX25 libero)
+//   - Pattern a 64 step divisi in 4 sezioni: A=0..15 B=16..31 C=32..47 D=48..63
+//   - Fill dedicati (16 step, one-shot, pendenti al confine di blocco)
+//   - Song sequencer (256 slot)
+//   - Formato SD binario con header+CRC per pattern, fill e song
 //
 //   DRUM   : AudioPlaySerialflashRaw x9 (SPI Flash, CS=6)
 //            BD, SD, HHc, HOo, HH2, CLAP, PERC1, PERC2, PERC3
 //   TRACKS : AudioPlaySdWav x2 (SD, CS=10)
 //   OUTPUT : AudioOutputI2SQuad + 2x SGTL5000
 //
-// Layout righe seqArr[16][9][32]:
-//   0 = BD     1 = SD     2 = HH     3 = OH     4 = HH2
-//   5 = CLAP   6 = PERC1  7 = PERC2  8 = PERC3
+// Layout righe seqArr / seqFillArr:
+//   0=BD 1=SD 2=HH 3=OH 4=HH2 5=CLAP 6=PERC1 7=PERC2 8=PERC3
+// Codifica celle: 0=silenzio, 1..3=velocity soft/medium/accent
 //
-// Codifica celle:
-//   0     = silenzio
-//   1..3  = velocity soft / medium / accent
-//
-// Formato file pattern (PTN00.BIN .. PTN15.BIN):
-//   [0]      magic  'P'  (0x50)
-//   [1]      version     0x01
-//   [2]      num_rows    9
-//   [3]      num_cols    32
-//   [4..291] payload     288 byte row-major
-//   [292]    crc8_atm    poly 0x07, init 0x00
+// File SD (root):
+//   PTN00.BIN      .. PTN15.BIN       v0x02  9x64  581 byte
+//                                     v0x01  9x32  293 byte (legacy upscale)
+//   PTN_FILL00.BIN .. PTN_FILL15.BIN  v0x01  9x16  149 byte
+//   SONG00.BIN     .. SONG15.BIN      v0x01  256 slot  517 byte
 //
 // LWS:
 //   MCU_ID='T', Serial3 @ 1 Mbps (TX=14, RX=15)
-//   Chiavi PARAM (target='T'): R,S,N,K,T,X,d,f,m,t,u,b,W,F,M,V,A,L,P,I,e,1..8,Z,C
+//   Chiavi PARAM (target='T'):
+//     R,S                 run/stop
+//     N,K,T,X             pattern, kit, track, sync
+//     d,f,m,t,u           livelli master
+//     b,W,F               bpm, swing, fill count (legacy)
+//     M                   mute bitmask
+//     V,A,L,P,I,e,1..8    edit kit / fx
+//     y,s,o,i,h           playMode, song, section, fill, fill trigger
+//     Z,C                 dump status / cpu info
 // =====================================================================
 
 #include <Arduino.h>
@@ -48,6 +42,10 @@
 // Config nodo LWS (PRIMA degli include LWS)
 // ---------------------------------------------------------------------
 #define MCU_ID      'T'
+// Target dei messaggi LWS uscenti dal Teensy: il Router
+#ifndef LWS_OUT_TARGET
+#define LWS_OUT_TARGET 'R'
+#endif
 #define LWS_SERIAL  Serial3          // Teensy 4.1: TX=14, RX=15
 #define LWS_DEBUG   Serial           // USB
 #define LWS_BAUD    1000000UL        // 1 Mbps sul bus LWS
@@ -70,9 +68,9 @@
 #define SERIALFLASH_CS   6
 #define SD_CS            10
 // LWS   : Serial3 = TX14, RX15
-// MIDI  : Serial6 = TX24, RX25
 // SPI   : MISO=12, MOSI=11, SCK=13 (condiviso SD + Flash)
 // I2S   : da Teensy Audio Shield (pin 7,8,18,19,20,21,23)
+// Serial6 (TX24/RX25) libero
 
 // =====================================================================
 // AUDIO GRAPH
@@ -81,9 +79,9 @@
 // colpo può avere uno dei tre livelli di velocity (soft/medium/accent).
 //
 // HH e OH hanno player, amp ed envelope separati:
-//   soundHhC -> ampHh -> envHh -\
+//   soundHhC -> ampHh -> envHh -
 //                                > mixHH -> mixDrum1L/R (canale 1)
-//   soundHhO -> ampOH -> envOH -/
+//   soundHhO -> ampOH -> envOH -
 // L'envelope serve solo a un fade-out rapido (5 ms) per il choke
 // pulito tra closed e open.
 // =====================================================================
@@ -221,34 +219,43 @@ const String trackNameArr[5] = {"CompSl","track2","track3","track4","track5"};
 // =====================================================================
 // STATO SEQUENCER / MIXER
 // =====================================================================
-int step = 0;
-int fineSeq = 15;
-unsigned long seqTime = 120;
-unsigned long swingTime = 30;
-unsigned long swingMax = 0;
+unsigned long seqTime    = 120;
+unsigned long swingTime  = 30;
+unsigned long swingMax   = 0;
 unsigned long preSeqTime = 120;
 
 byte seqRunning = 0;
-byte sync = 0;                    // 0=int, 1=SD track, 2=ext
-long sdTotTime = 0;
-int fillNum = 8;
-int contaFillNum = 1;
-byte togSdWave = 1;
-byte togPeak = 0;
+byte sync       = 0;              // 0=int, 1=SD track, 2=ext
+long sdTotTime  = 0;
+byte togSdWave  = 1;
+byte togPeak    = 0;
 
-int bpm = 120;
-int kitNum = 1;
+int bpm       = 120;
+int kitNum    = 1;
 int preKitNum = 1;
 
 byte bdMute=0, sdMute=0, clapMute=0, hhMute=0, hh2Mute=0, percMute=1;
 
 int track2exist = 0;
-int ptnNum = 0;
-int prePtnNum = 0;
+int ptnNum      = 0;
+int prePtnNum   = 0;
 byte autoStepZero = 1;
 
 int voiceSel = 1;                 // 1..9 (BD,SD,HH,OH,HH2,CLAP,PRC1,PRC2,PRC3)
 int tempRevPreset = 0;
+
+// ---- Stato playback (nuovo modello) ---------------------------------
+byte  playMode   = 0;             // 0=pattern, 1=song
+byte  curSection = 0;             // 0=A 1=B 2=C 3=D (pattern mode)
+byte  preSection = 0;             // sezione pendente
+byte  fillNum    = 0;             // fill attivo
+byte  preFillNum = 0;             // fill selezionato (pendente)
+bool  playingFill = false;        // fill in esecuzione
+bool  fillPending = false;        // trigger in attesa del boundary
+int   songNum    = 0;
+int   songPos    = 0;
+int   curSubStep = 0;             // 0..15 dentro il blocco corrente
+byte* curBlock[9];                // puntatori ai 16 step correnti per voce
 
 elapsedMillis msecs, trigMsecs, trigOutMs;
 File myFile;
@@ -257,23 +264,25 @@ File myFile;
 #include "mem.h"
 
 // =====================================================================
-// HELPERS
+// HELPERS GENERALI
 // =====================================================================
-float mapFloat(float val, float daMin, float daMax, float aMin, float aMax) {
-  return (val - daMin) * (aMax - aMin) / (daMax - daMin) + aMin;
-}
-
 void bpmToTime(int bpm2) {
   preSeqTime = floor((60000 / bpm2) / 4);
   swingMax = floor((preSeqTime / 2) - 2);
 }
 
-int soundPiuMeno(int val, byte Pm, int strum) {
-  if (Pm == 1) val++;
-  if (Pm == 0) val--;
-  if (val > maxArr[strum]) val = maxArr[strum];
-  if (val < 1) val = 0;
-  return val;
+void cpuUsage() {
+  LWS_DEBUG.printf("CPU=%0.1f%% max=%0.1f%% mem=%u max=%u\n",
+                   AudioProcessorUsage(), AudioProcessorUsageMax(),
+                   AudioMemoryUsage(), AudioMemoryUsageMax());
+}
+
+void getTempoTrack(int num) {
+  int ms = trackTempoArr[num];
+  int sec = ms / 1000;
+  int min = sec / 60;
+  sec %= 60;
+  LWS_DEBUG.printf("track %d: %d:%02d\n", num, min, sec);
 }
 
 // ---------------------------------------------------------------------
@@ -287,6 +296,9 @@ inline void setVel(AudioAmplifier &amp, int v) {
   amp.gain(velGain[v]);
 }
 
+// ---------------------------------------------------------------------
+// Controlli mixer / effetti
+// ---------------------------------------------------------------------
 void fxOutLev(float lev) {
   AudioNoInterrupts();
   mixOutL.gain(3, lev);
@@ -347,58 +359,46 @@ void mixLev() {
   AudioInterrupts();
 }
 
-void cpuUsage() {
-  LWS_DEBUG.printf("CPU=%0.1f%% max=%0.1f%% mem=%u max=%u\n",
-                   AudioProcessorUsage(), AudioProcessorUsageMax(),
-                   AudioMemoryUsage(), AudioMemoryUsageMax());
-}
-
-void getTempoTrack(int num) {
-  int ms = trackTempoArr[num];
-  int sec = ms / 1000;
-  int min = sec / 60;
-  sec %= 60;
-  LWS_DEBUG.printf("track %d: %d:%02d\n", num, min, sec);
-}
-
 // =====================================================================
-// SD PATTERN — formato binario .BIN
+// SD I/O — Pattern / Fill / Song in formato binario
 // ---------------------------------------------------------------------
-// File: PTN00.BIN .. PTN15.BIN (293 byte ciascuno)
-//   [0]      magic  'P'  (0x50)
-//   [1]      version     0x01
-//   [2]      num_rows    9
-//   [3]      num_cols    32
-//   [4..291] payload     9*32 = 288 byte, row-major
-//   [292]    crc8_atm    poly 0x07, init 0x00
-//
-// Layout righe del payload:
-//   0=BD 1=SD 2=HH 3=OH 4=HH2 5=CLAP 6=PERC1 7=PERC2 8=PERC3
-// Valori 0..3 (0=silenzio, 1..3=velocity soft/medium/accent)
+// Tutti i file hanno: magic + version + dims + payload + CRC8/ATM.
+// Convenzione nomi: PTNxx.BIN, PTN_FILLxx.BIN, SONGxx.BIN.
 // =====================================================================
 
-static const uint8_t PTN_MAGIC   = 0x50;   // 'P'
-static const uint8_t PTN_VERSION = 0x01;
-static const uint8_t PTN_ROWS    = 9;
-static const uint8_t PTN_COLS    = 32;
-static const size_t  PTN_HDR     = 4;
-static const size_t  PTN_PAYLOAD = PTN_ROWS * PTN_COLS;      // 288
-static const size_t  PTN_TOTAL   = PTN_HDR + PTN_PAYLOAD + 1; // 293
+// --- Costanti formato ------------------------------------------------
+static const uint8_t PTN_MAGIC    = 0x50;   // 'P'
+static const uint8_t PTN_V2       = 0x02;
+static const uint8_t PTN_V1       = 0x01;
+static const uint8_t PTN_ROWS     = 9;
+static const uint8_t PTN_COLS_V2  = 64;
+static const uint8_t PTN_COLS_V1  = 32;
 
-// CRC-8/ATM (poly 0x07, init 0x00), coerente con serial_protocol.h
+static const uint8_t FILL_MAGIC   = 0x46;   // 'F'
+static const uint8_t FILL_VERSION = 0x01;
+static const uint8_t FILL_ROWS    = 9;
+static const uint8_t FILL_COLS    = 16;
+
+static const uint8_t SONG_MAGIC   = 0x53;   // 'S'
+static const uint8_t SONG_VERSION = 0x01;
+static const int     SONG_SLOTS   = 256;
+
+// --- CRC-8/ATM (poly 0x07, init 0x00) --------------------------------
 static uint8_t crc8_atm(const uint8_t *data, size_t len) {
   uint8_t crc = 0x00;
   for (size_t i = 0; i < len; i++) {
     crc ^= data[i];
-    for (uint8_t b = 0; b < 8; b++) {
+    for (uint8_t b = 0; b < 8; b++)
       crc = (crc & 0x80) ? ((crc << 1) ^ 0x07) : (crc << 1);
-    }
   }
   return crc;
 }
 
-// Legge PTNxx.BIN in seqArr[w]. Ritorna true se ok.
-// In caso di errore lascia seqArr[w] invariato (il chiamante ha già azzerato).
+// ---------------------------------------------------------------------
+// Pattern: PTNxx.BIN  — 9 voci × 64 step
+//   V2 (581 B): 4 header + 576 payload + 1 crc
+//   V1 (293 B): 4 header + 288 payload + 1 crc  (upscalato in RAM)
+// ---------------------------------------------------------------------
 static bool leggiPtnBin(int w) {
   char fname[13];
   snprintf(fname, sizeof(fname), "PTN%02d.BIN", w);
@@ -406,253 +406,392 @@ static bool leggiPtnBin(int w) {
   File f = SD.open(fname, FILE_READ);
   if (!f) return false;
 
-  if (f.size() != PTN_TOTAL) {
-    LWS_DEBUG.printf("[SD] %s: dimensione errata (%lu, attesa %u)\n",
-                     fname, (unsigned long)f.size(), (unsigned)PTN_TOTAL);
-    f.close();
-    return false;
-  }
+  size_t sz = f.size();
+  size_t expectedV2 = 4 + PTN_ROWS * PTN_COLS_V2 + 1;
+  size_t expectedV1 = 4 + PTN_ROWS * PTN_COLS_V1 + 1;
+  if (sz != expectedV2 && sz != expectedV1) { f.close(); return false; }
 
-  uint8_t buf[PTN_TOTAL];
-  if (f.read(buf, PTN_TOTAL) != (int)PTN_TOTAL) {
-    f.close();
-    return false;
-  }
+  uint8_t buf[600];
+ if ((size_t)f.read(buf, sz) != sz) { f.close(); return false; }
   f.close();
 
-  // Header
-  if (buf[0] != PTN_MAGIC ||
-      buf[1] != PTN_VERSION ||
-      buf[2] != PTN_ROWS ||
-      buf[3] != PTN_COLS) {
-    LWS_DEBUG.printf("[SD] %s: header non valido\n", fname);
+  if (buf[0] != PTN_MAGIC || buf[2] != PTN_ROWS) return false;
+  if (crc8_atm(buf, sz - 1) != buf[sz - 1]) {
+    LWS_DEBUG.printf("[SD] %s: CRC errato\n", fname);
     return false;
   }
 
-  // CRC su header+payload (byte 0..291)
-  uint8_t crc_calc = crc8_atm(buf, PTN_TOTAL - 1);
-  if (crc_calc != buf[PTN_TOTAL - 1]) {
-    LWS_DEBUG.printf("[SD] %s: CRC errato (calc=%02X file=%02X)\n",
-                     fname, crc_calc, buf[PTN_TOTAL - 1]);
-    return false;
+  if (buf[1] == PTN_V2 && buf[3] == PTN_COLS_V2) {
+    memcpy(&seqArr[w][0][0], buf + 4, PTN_ROWS * PTN_COLS_V2);
+    return true;
   }
-
-  memcpy(&seqArr[w][0][0], buf + PTN_HDR, PTN_PAYLOAD);
-  return true;
+  if (buf[1] == PTN_V1 && buf[3] == PTN_COLS_V1) {
+    // Legacy: 32 step → sezioni A+B, C+D a zero
+    memset(&seqArr[w][0][0], 0, sizeof(seqArr[w]));
+    for (int v = 0; v < PTN_ROWS; v++)
+      memcpy(&seqArr[w][v][0], buf + 4 + v * PTN_COLS_V1, PTN_COLS_V1);
+    return true;
+  }
+  return false;
 }
 
-// Scrive seqArr[w] in PTNxx.BIN. Ritorna true se ok.
 static bool scriviPtnBin(int w) {
-  uint8_t buf[PTN_TOTAL];
-
+  size_t total = 4 + PTN_ROWS * PTN_COLS_V2 + 1;
+  uint8_t buf[600];
   buf[0] = PTN_MAGIC;
-  buf[1] = PTN_VERSION;
+  buf[1] = PTN_V2;
   buf[2] = PTN_ROWS;
-  buf[3] = PTN_COLS;
-  memcpy(buf + PTN_HDR, &seqArr[w][0][0], PTN_PAYLOAD);
-  buf[PTN_TOTAL - 1] = crc8_atm(buf, PTN_TOTAL - 1);
+  buf[3] = PTN_COLS_V2;
+  memcpy(buf + 4, &seqArr[w][0][0], PTN_ROWS * PTN_COLS_V2);
+  buf[total - 1] = crc8_atm(buf, total - 1);
 
   char fname[13];
   snprintf(fname, sizeof(fname), "PTN%02d.BIN", w);
-
   SD.remove(fname);
   File f = SD.open(fname, FILE_WRITE);
   if (!f) return false;
-  size_t written = f.write(buf, PTN_TOTAL);
+  size_t wr = f.write(buf, total);
   f.close();
-  return (written == PTN_TOTAL);
+  return (wr == total);
 }
 
-// Carica tutti i 16 pattern. Un file mancante o invalido lascia
-// il pattern corrispondente a zero.
+// ---------------------------------------------------------------------
+// Fill: PTN_FILLxx.BIN  — 9 voci × 16 step  (149 B)
+// ---------------------------------------------------------------------
+static bool leggiFillBin(int w) {
+  char fname[20];
+  snprintf(fname, sizeof(fname), "PTN_FILL%02d.BIN", w);
+
+  File f = SD.open(fname, FILE_READ);
+  if (!f) return false;
+
+  size_t total = 4 + FILL_ROWS * FILL_COLS + 1;
+  if (f.size() != total) { f.close(); return false; }
+
+  uint8_t buf[160];
+  if ((size_t)f.read(buf, total) != (size_t)total) { f.close(); return false; }
+  f.close();
+
+  if (buf[0] != FILL_MAGIC || buf[1] != FILL_VERSION) return false;
+  if (buf[2] != FILL_ROWS  || buf[3] != FILL_COLS)    return false;
+  if (crc8_atm(buf, total - 1) != buf[total - 1])     return false;
+
+  memcpy(&seqFillArr[w][0][0], buf + 4, FILL_ROWS * FILL_COLS);
+  return true;
+}
+
+static bool scriviFillBin(int w) {
+  size_t total = 4 + FILL_ROWS * FILL_COLS + 1;
+  uint8_t buf[160];
+  buf[0] = FILL_MAGIC;
+  buf[1] = FILL_VERSION;
+  buf[2] = FILL_ROWS;
+  buf[3] = FILL_COLS;
+  memcpy(buf + 4, &seqFillArr[w][0][0], FILL_ROWS * FILL_COLS);
+  buf[total - 1] = crc8_atm(buf, total - 1);
+
+  char fname[20];
+  snprintf(fname, sizeof(fname), "PTN_FILL%02d.BIN", w);
+  SD.remove(fname);
+  File f = SD.open(fname, FILE_WRITE);
+  if (!f) return false;
+  size_t wr = f.write(buf, total);
+  f.close();
+  return (wr == total);
+}
+
+// ---------------------------------------------------------------------
+// Song: SONGxx.BIN  — 256 slot  (517 B)
+//   [0]='S' [1]=ver [2]=songLen [3]=reserved
+//   [4..515] payload interleaved tipo,numero per 256 slot
+//   [516] crc8
+// ---------------------------------------------------------------------
+static bool leggiSongBin(int s) {
+  char fname[13];
+  snprintf(fname, sizeof(fname), "SONG%02d.BIN", s);
+
+  File f = SD.open(fname, FILE_READ);
+  if (!f) return false;
+
+  size_t total = 4 + SONG_SLOTS * 2 + 1;
+  if (f.size() != total) { f.close(); return false; }
+
+  uint8_t buf[520];
+ if ((size_t)f.read(buf, total) != (size_t)total) { f.close(); return false; }
+  f.close();
+
+  if (buf[0] != SONG_MAGIC || buf[1] != SONG_VERSION) return false;
+  if (crc8_atm(buf, total - 1) != buf[total - 1]) return false;
+
+  songLen[s] = buf[2];
+  if (songLen[s] > 255) songLen[s] = 255;  
+  for (int i = 0; i < SONG_SLOTS; i++) {
+    songArr[s][0][i] = buf[4 + i * 2];
+	
+    songArr[s][1][i] = buf[4 + i * 2 + 1];
+  }
+  return true;
+}
+
+static bool scriviSongBin(int s) {
+  size_t total = 4 + SONG_SLOTS * 2 + 1;
+  uint8_t buf[520];
+  buf[0] = SONG_MAGIC;
+  buf[1] = SONG_VERSION;
+  buf[2] = songLen[s];
+  buf[3] = 0;
+  for (int i = 0; i < SONG_SLOTS; i++) {
+    buf[4 + i * 2]     = songArr[s][0][i];
+    buf[4 + i * 2 + 1] = songArr[s][1][i];
+  }
+  buf[total - 1] = crc8_atm(buf, total - 1);
+
+  char fname[13];
+  snprintf(fname, sizeof(fname), "SONG%02d.BIN", s);
+  SD.remove(fname);
+  File f = SD.open(fname, FILE_WRITE);
+  if (!f) return false;
+  size_t wr = f.write(buf, total);
+  f.close();
+  return (wr == total);
+}
+
+// ---------------------------------------------------------------------
+// Orchestrazione
+// ---------------------------------------------------------------------
 void leggiSd() {
-  memset(seqArr, 0, sizeof(seqArr));
+  memset(seqArr,     0, sizeof(seqArr));
+  memset(seqFillArr, 0, sizeof(seqFillArr));
+  memset(songArr,    0, sizeof(songArr));
+  memset(songLen,    0, sizeof(songLen));
 
-  int ok = 0;
-  for (int w = 0; w < 16; w++) {
-    if (leggiPtnBin(w)) ok++;
-  }
-  LWS_DEBUG.printf("[SD] pattern caricati: %d/16\n", ok);
+  int okP = 0, okF = 0, okS = 0;
+  for (int w = 0; w < 16; w++) if (leggiPtnBin (w)) okP++;
+  for (int w = 0; w < 16; w++) if (leggiFillBin(w)) okF++;
+  for (int s = 0; s < 16; s++) if (leggiSongBin(s)) okS++;
+  LWS_DEBUG.printf("[SD] PTN:%d/16 FILL:%d/16 SONG:%d/16\n", okP, okF, okS);
 }
 
-// Riscrive tutti i 16 pattern come .BIN.
 void scriviSd() {
-  int ok = 0;
-  for (int w = 0; w < 16; w++) {
-    if (scriviPtnBin(w)) ok++;
-    else LWS_DEBUG.printf("[SD] scrittura PTN%02d.BIN fallita\n", w);
-    delay(5);   // lascia respirare la SD
+  int okP = 0, okF = 0, okS = 0;
+  for (int w = 0; w < 16; w++) if (scriviPtnBin (w)) okP++;
+  for (int w = 0; w < 16; w++) if (scriviFillBin(w)) okF++;
+  for (int s = 0; s < 16; s++) if (scriviSongBin(s)) okS++;
+  LWS_DEBUG.printf("[SD] scritti PTN:%d FILL:%d SONG:%d\n", okP, okF, okS);
+}
+
+// =====================================================================
+// PLAYBACK — gestione blocchi
+// ---------------------------------------------------------------------
+// curBlock[v] punta ai 16 step correnti della voce v. A seconda del
+// tipo di blocco punta dentro seqArr (sezione 0..3) o seqFillArr.
+// =====================================================================
+
+// type: 0..3 = sezione A..D di seqArr[idx]
+//       4    = fill idx di seqFillArr
+void setCurrentBlock(byte type, byte idx) {
+  for (int v = 0; v < 9; v++) {
+    if (type <= 3) curBlock[v] = &seqArr[idx][v][type * 16];
+    else           curBlock[v] = &seqFillArr[idx][v][0];
   }
-  LWS_DEBUG.printf("[SD] pattern scritti: %d/16\n", ok);
+}
+
+// Avanza al blocco successivo. Chiamata a fine dei 16 step.
+//
+// Priorità al confine (pattern mode):
+//   1) se un fill è in esecuzione → chiudi e vai alla sezione pendente
+//   2) altrimenti se un trigger è in attesa → avvia il fill corrente
+//   3) altrimenti → applica la sezione pendente
+// Poi applica il pattern pendente e infine il kit pendente.
+void advanceBlock() {
+  if (playMode == 0) {
+    // ---- PATTERN MODE ----------------------------------------------
+    fillNum = preFillNum;
+
+    if (playingFill) {
+      // Fill terminato: torna alla sezione pendente (default A)
+      playingFill = false;
+      curSection  = preSection;
+      setCurrentBlock(curSection, ptnNum);
+      lws_send_param(LWS_OUT_TARGET, 'h', 0);    // 0 = idle
+
+    } else if (fillPending) {
+      // Trigger in attesa: parte il fill corrente
+      fillPending = false;
+      playingFill = true;
+      setCurrentBlock(4, fillNum);
+      lws_send_param(LWS_OUT_TARGET, 'h', 1);    // 1 = playing
+
+    } else {
+      // Nessun fill: applica la sezione pendente
+      curSection = preSection;
+      setCurrentBlock(curSection, ptnNum);
+    }
+
+    // Pattern pendente (non tocca un fill in corso)
+    if (prePtnNum != ptnNum) {
+      ptnNum = prePtnNum;
+      if (!playingFill) setCurrentBlock(curSection, ptnNum);
+    }
+
+  } else {
+    // ---- SONG MODE -------------------------------------------------
+    if (songLen[songNum] == 0) { seqRunning = 0; return; }
+    songPos++;
+    if (songPos >= songLen[songNum]) songPos = 0;
+    byte t = songArr[songNum][0][songPos];
+    byte n = songArr[songNum][1][songPos];
+    if (t > 4) t = 0;
+    setCurrentBlock(t, n);
+  }
+
+  // Kit pendente (globale, entrambi i modi)
+  if (preKitNum != kitNum) {
+    kitNum = preKitNum;
+    mixLev();
+    setRev(kitNum - 1);
+  }
 }
 
 // =====================================================================
 // SEQUENCER
 // ---------------------------------------------------------------------
-// Layout righe seqArr[16][9][32]:
-//   0=BD  1=SD  2=HH  3=OH  4=HH2  5=CLAP  6=PERC1  7=PERC2  8=PERC3
-//
-// Celle:
-//   0     = silenzio
-//   1..3  = velocity soft / medium / accent
-//
-// HH e OH hanno player, amp ed envelope separati. L'envelope chiude
-// in 5 ms quando parte l'altro ramo (choke pulito). Se sullo stesso
-// step entrambe le righe sono >0, vince HH.
+// Legge sempre da curBlock[v][curSubStep] (v=0..8, step 0..15).
 // =====================================================================
 void seqRun() {
   int numR = 0;
 
-  // -------------------------------------------------------------------
   // Voce 0 — BD
-  // -------------------------------------------------------------------
-  if (seqArr[ptnNum][0][step] > 0 && bdMute == 0) {
-    setVel(ampBd, seqArr[ptnNum][0][step]);
+  if (curBlock[0][curSubStep] > 0 && bdMute == 0) {
+    setVel(ampBd, curBlock[0][curSubStep]);
     numR = random(1, bdArrSize[kitArr[0][kitNum - 1]]);
     soundBd.play(bdArr[kitArr[0][kitNum - 1]][numR - 1]);
   }
 
-  // -------------------------------------------------------------------
   // Voce 1 — SD
-  // -------------------------------------------------------------------
-  if (seqArr[ptnNum][1][step] > 0 && sdMute == 0) {
-    setVel(ampSD, seqArr[ptnNum][1][step]);
+  if (curBlock[1][curSubStep] > 0 && sdMute == 0) {
+    setVel(ampSD, curBlock[1][curSubStep]);
     numR = random(1, sdArrSize[kitArr[1][kitNum - 1]]);
     soundSd.play(sdArr[kitArr[1][kitNum - 1]][numR - 1]);
   }
 
-  // -------------------------------------------------------------------
   // Voci 2 + 3 — HH (closed) e OH (open) con choke reciproco pulito
-  // -------------------------------------------------------------------
   if (hhMute == 0) {
-    uint8_t hhVel = seqArr[ptnNum][2][step];
-    uint8_t ohVel = seqArr[ptnNum][3][step];
-
+    uint8_t hhVel = curBlock[2][curSubStep];
+    uint8_t ohVel = curBlock[3][curSubStep];
     if (hhVel > 0) {
-      // CLOSED: vel 1..3; choke dell'open via envelope
       setVel(ampHh, hhVel);
-      envOH.noteOff();                          // fade-out 5 ms sull'open
+      envOH.noteOff();
       numR = random(1, hhArrSize[kitArr[2][kitNum - 1]]);
       soundHhC.play(hhArr[kitArr[2][kitNum - 1]][numR - 1]);
       envHh.noteOn();
     } else if (ohVel > 0) {
-      // OPEN: vel 1..3; choke del closed via envelope
       setVel(ampOH, ohVel);
-      envHh.noteOff();                          // fade-out 5 ms sul closed
+      envHh.noteOff();
       numR = random(1, ohArrSize[kitArr[3][kitNum - 1]]);
       soundHhO.play(ohArr[kitArr[3][kitNum - 1]][numR - 1]);
       envOH.noteOn();
     }
   }
 
-  // -------------------------------------------------------------------
   // Voce 4 — HH2
-  // -------------------------------------------------------------------
-  if (seqArr[ptnNum][4][step] > 0 && hh2Mute == 0) {
-    setVel(ampHH2, seqArr[ptnNum][4][step]);
+  if (curBlock[4][curSubStep] > 0 && hh2Mute == 0) {
+    setVel(ampHH2, curBlock[4][curSubStep]);
     numR = random(1, hhArrSize[kitArr[4][kitNum - 1]]);
     soundHh2.play(hhArr[kitArr[4][kitNum - 1]][numR - 1]);
   }
 
-  // -------------------------------------------------------------------
   // Voce 5 — CLAP
-  // -------------------------------------------------------------------
-  if (seqArr[ptnNum][5][step] > 0 && clapMute == 0) {
-    setVel(ampClap, seqArr[ptnNum][5][step]);
+  if (curBlock[5][curSubStep] > 0 && clapMute == 0) {
+    setVel(ampClap, curBlock[5][curSubStep]);
     numR = random(1, clapArrSize[kitArr[5][kitNum - 1]]);
     soundClap.play(clapArr[kitArr[5][kitNum - 1]][numR - 1]);
   }
 
-  // -------------------------------------------------------------------
   // Voce 6 — PERC1
-  // -------------------------------------------------------------------
-  if (seqArr[ptnNum][6][step] > 0 && percMute == 0) {
-    setVel(ampPerc1, seqArr[ptnNum][6][step]);
+  if (curBlock[6][curSubStep] > 0 && percMute == 0) {
+    setVel(ampPerc1, curBlock[6][curSubStep]);
     numR = random(1, perc1ArrSize[kitArr[6][kitNum - 1]]);
     soundPerc1.play(perc1Arr[kitArr[6][kitNum - 1]][numR - 1]);
   }
 
-  // -------------------------------------------------------------------
   // Voce 7 — PERC2
-  // -------------------------------------------------------------------
-  if (seqArr[ptnNum][7][step] > 0 && percMute == 0) {
-    setVel(ampPerc2, seqArr[ptnNum][7][step]);
+  if (curBlock[7][curSubStep] > 0 && percMute == 0) {
+    setVel(ampPerc2, curBlock[7][curSubStep]);
     numR = random(1, perc2ArrSize[kitArr[7][kitNum - 1]]);
     soundPerc2.play(perc2Arr[kitArr[7][kitNum - 1]][numR - 1]);
   }
 
-  // -------------------------------------------------------------------
   // Voce 8 — PERC3
-  // -------------------------------------------------------------------
-  if (seqArr[ptnNum][8][step] > 0 && percMute == 0) {
-    setVel(ampPerc3, seqArr[ptnNum][8][step]);
+  if (curBlock[8][curSubStep] > 0 && percMute == 0) {
+    setVel(ampPerc3, curBlock[8][curSubStep]);
     numR = random(1, perc3ArrSize[kitArr[8][kitNum - 1]]);
     soundPerc3.play(perc3Arr[kitArr[8][kitNum - 1]][numR - 1]);
   }
 
-  // -------------------------------------------------------------------
-  // Swing
-  // -------------------------------------------------------------------
-  if (step % 2 == 0) seqTime = preSeqTime + swingTime;
-  else               seqTime = preSeqTime - swingTime;
+  // Swing (basato sullo step dentro il blocco)
+  if (curSubStep % 2 == 0) seqTime = preSeqTime + swingTime;
+  else                     seqTime = preSeqTime - swingTime;
 
-  step++;
-
-  // -------------------------------------------------------------------
-  // Fine pattern / cambio kit / pattern pendenti
-  // -------------------------------------------------------------------
-  if (step > fineSeq) {
-    contaFillNum++;
-
-    if (sync == 0) fillNum = fillArr[ptnNum];
-    if (sync == 1) fillNum = trackFillArr[trackSdNum];
-
-    if (contaFillNum < fillNum) {
-      step = 0;
-      fineSeq = 15;
-    } else {
-      contaFillNum = 0;
-      step = 16;
-      fineSeq = 31;
-    }
-
-    if (preKitNum != kitNum) {
-      kitNum = preKitNum;
-      mixLev();
-      setRev(kitNum - 1);
-    }
-    if (prePtnNum != ptnNum) {
-      ptnNum = prePtnNum;
-    }
+  curSubStep++;
+  if (curSubStep >= 16) {
+    curSubStep = 0;
+    advanceBlock();
   }
 }
 
+// =====================================================================
+// START / STOP
+// =====================================================================
 void startStop() {
   if (sync == 0) {
     if (seqRunning == 0) {
-      seqRunning = 1; togSdWave = 1; step = 0;
+      // START
+      seqRunning  = 1;
+      togSdWave   = 1;
+      curSubStep  = 0;
+      playingFill = false;
+      fillPending = false;
+      fillNum     = preFillNum;
+
+      if (playMode == 0) {
+        curSection = preSection = 0;
+        setCurrentBlock(0, ptnNum);
+      } else {
+        if (songLen[songNum] == 0) { seqRunning = 0; return; }
+        songPos = 0;
+        byte t = songArr[songNum][0][0];
+        byte n = songArr[songNum][1][0];
+        if (t > 4) t = 0;
+        setCurrentBlock(t, n);
+      }
     } else {
-      seqRunning = 0; contaFillNum = 1;
-      togSdWave = 1; step = 0; swingTime = 30;
+      // STOP
+      seqRunning  = 0;
+      togSdWave   = 1;
+      swingTime   = 30;
+      playingFill = false;
+      fillPending = false;
+      curSubStep  = 0;
     }
   }
+
   if (sync == 1) {
     if (seqRunning == 0) {
       seqRunning = 1;
-      kitNum = preKitNum;
-      swingTime = 0;
-      percMute = 1;
-      togSdWave = 0;
-      step = 0;
+      kitNum     = preKitNum;
+      swingTime  = 0;
+      percMute   = 1;
+      togSdWave  = 0;
+      curSubStep = 0;
     } else {
       seqRunning = 0;
-      sdTotTime = 0;
+      sdTotTime  = 0;
       if (track2exist == 1) playSdWav2.stop();
       playSdWav.stop();
-      percMute = 1;
-      togSdWave = 1;
-      step = 0;
-      contaFillNum = 1;
+      percMute   = 1;
+      togSdWave  = 1;
+      curSubStep = 0;
     }
   }
 }
@@ -798,27 +937,21 @@ void on_param(char target, char key, uint8_t value) {
     case 'm': {
       uint8_t n = constrain(v, 0, 20);
       trackLevArr[trackSdNum] = n;
-      AudioNoInterrupts();
-      mixOutMono.gain(0, levArr[n]);
-      AudioInterrupts();
+      AudioNoInterrupts(); mixOutMono.gain(0, levArr[n]); AudioInterrupts();
       lws_send_param(LWS_OUT_TARGET, 'm', n);
       break;
     }
     case 't': {
       uint8_t n = constrain(v, 0, 20);
       track2LevArr[trackSdNum] = n;
-      AudioNoInterrupts();
-      mixOutMono.gain(1, levArr[n]);
-      AudioInterrupts();
+      AudioNoInterrupts(); mixOutMono.gain(1, levArr[n]); AudioInterrupts();
       lws_send_param(LWS_OUT_TARGET, 't', n);
       break;
     }
     case 'u': {
       uint8_t n = constrain(v, 0, 20);
       track3LevArr[trackSdNum] = n;
-      AudioNoInterrupts();
-      mixOutMono.gain(2, levArr[n]);
-      AudioInterrupts();
+      AudioNoInterrupts(); mixOutMono.gain(2, levArr[n]); AudioInterrupts();
       lws_send_param(LWS_OUT_TARGET, 'u', n);
       break;
     }
@@ -833,18 +966,16 @@ void on_param(char target, char key, uint8_t value) {
       swingTime = (unsigned long)constrain(v, 0, (int)swingMax);
       lws_send_param(LWS_OUT_TARGET, 'W', (uint8_t)swingTime);
       break;
-    case 'F': {
-      uint8_t n = constrain(v, 2, 32);
-      fillArr[ptnNum] = n;
-      lws_send_param(LWS_OUT_TARGET, 'F', n);
+    case 'F':
+      // Legacy: la logica di fill-count è stata rimossa.
+      // La chiave è accettata e ignorata per non rompere il Display.
       break;
-    }
 
     // Mute (bitmask) — bit2 = HH+OH, bit3 = HH2
     case 'M':
       bdMute   = (value & 0x01) ? 1 : 0;
       sdMute   = (value & 0x02) ? 1 : 0;
-      hhMute   = (value & 0x04) ? 1 : 0;   // HH + OH insieme
+      hhMute   = (value & 0x04) ? 1 : 0;
       hh2Mute  = (value & 0x08) ? 1 : 0;
       clapMute = (value & 0x10) ? 1 : 0;
       percMute = (value & 0x20) ? 1 : 0;
@@ -874,6 +1005,47 @@ void on_param(char target, char key, uint8_t value) {
       lws_send_param(LWS_OUT_TARGET, key, value);
       break;
 
+    // ---------------- MODALITÀ / SONG / SEZIONE / FILL --------------
+    case 'y':                                     // play mode
+      if (!seqRunning) {
+        playMode = constrain(v, 0, 1);
+        lws_send_param(LWS_OUT_TARGET, 'y', playMode);
+      }
+      break;
+
+    case 's':                                     // song select
+      songNum = constrain(v, 0, 15);
+      if (playMode == 1 && seqRunning && songLen[songNum] > 0) {
+        songPos = 0;
+        byte t = songArr[songNum][0][0];
+        byte n = songArr[songNum][1][0];
+        if (t > 4) t = 0;
+        setCurrentBlock(t, n);
+        curSubStep = 0;
+      }
+      lws_send_param(LWS_OUT_TARGET, 's', songNum);
+      break;
+
+    case 'o':                                     // section select
+      if (playMode == 0) {
+        preSection = constrain(v, 0, 3);
+        lws_send_param(LWS_OUT_TARGET, 'o', preSection);
+      }
+      break;
+
+    case 'i':                                     // fill select
+      preFillNum = constrain(v, 0, 15);
+      lws_send_param(LWS_OUT_TARGET, 'i', preFillNum);
+      break;
+
+    case 'h':                                     // fill trigger (pendente)
+      if (playMode == 0 && seqRunning
+          && !playingFill && !fillPending) {
+        fillPending = true;
+        lws_send_param(LWS_OUT_TARGET, 'h', 2);   // 2 = pending
+      }
+      break;
+
     // Sistema
     case 'Z': dumpStatus(); break;
     case 'C': cpuUsage();  break;
@@ -897,17 +1069,24 @@ void on_bend(int32_t b) {
   LWS_DEBUG.printf("[LWS] BEND %ld\n", (long)b);
 }
 
-
 // =====================================================================
 // DUMP STATO
 // =====================================================================
 void dumpStatus() {
-  LWS_DEBUG.printf("run=%u sync=%u bpm=%d ptn=%d kit=%d step=%d track=%d\n",
-                   seqRunning, sync, bpm, ptnNum, preKitNum, step, trackSdNum);
-  LWS_DEBUG.printf("drum=%d fx=%d mono=%d tk2=%d tk3=%d fill=%d swing=%lu\n",
+  LWS_DEBUG.printf("run=%u sync=%u bpm=%d mode=%u ptn=%d sec=%u fill=%u "
+                   "song=%d pos=%d len=%u substep=%d\n",
+                   seqRunning, sync, bpm, playMode,
+                   ptnNum, curSection, fillNum,
+                   songNum, songPos, songLen[songNum], curSubStep);
+  LWS_DEBUG.printf("fillTrig=%u preSec=%u preFill=%u prePtn=%d preKit=%d\n",
+                   playingFill ? 1 : (fillPending ? 2 : 0),
+                   preSection, preFillNum, prePtnNum, preKitNum);
+  LWS_DEBUG.printf("kit=%d track=%d swing=%lu drum=%d fx=%d "
+                   "mono=%d tk2=%d tk3=%d\n",
+                   kitNum, trackSdNum, swingTime,
                    levPtnArr[1][ptnNum], levPtnArr[0][ptnNum],
                    trackLevArr[trackSdNum], track2LevArr[trackSdNum],
-                   track3LevArr[trackSdNum], fillArr[ptnNum], swingTime);
+                   track3LevArr[trackSdNum]);
   LWS_DEBUG.printf("mute BD=%u SD=%u HH+OH=%u HH2=%u CLAP=%u PERC=%u\n",
                    bdMute, sdMute, hhMute, hh2Mute, clapMute, percMute);
   LWS_DEBUG.printf("voiceSel=%d snd=%d lev=%d pan=%d\n",
@@ -933,10 +1112,10 @@ void dumpStatus() {
 // =====================================================================
 void setup() {
   LWS_DEBUG.begin(115200);
-  LWS_DEBUG.println("=== Lud-WS-Teensy boot (rev11, sampler+LWS+3vel+BIN) ===");
+  LWS_DEBUG.println("=== Lud-WS-Teensy boot (rev12, BIN+fill+song) ===");
   LWS_DEBUG.printf("MCU_ID='%c' LWS_BAUD=%lu\n", MCU_ID, (unsigned long)LWS_BAUD);
 
-  LWS_SERIAL.begin(LWS_BAUD);           // Serial3 @ 1 Mbps (TX=14, RX=15)
+  LWS_SERIAL.begin(LWS_BAUD);
 
   lws_set_callbacks(on_param, on_error);
   lws_set_midi_callbacks(on_cc, on_note, on_bend);
@@ -953,7 +1132,7 @@ void setup() {
     LWS_DEBUG.println("SerialFlash OK");
   }
 
-  // SD (tracce WAV + pattern BIN)
+  // SD (tracce WAV + pattern/fill/song BIN)
   if (!SD.begin(SD_CS)) {
     LWS_DEBUG.println("SD FAILED");
   } else {
@@ -983,7 +1162,6 @@ void setup() {
   envOH.sustain(1.0f); envOH.release(5.0f);
 
   // --- Gain iniziali degli amplificatori di velocity ---------------
-  // Partono a 1.0; verranno ricalcolati a ogni colpo da setVel().
   ampBd.gain(1.0f);
   ampSD.gain(1.0f);
   ampHh.gain(1.0f);
@@ -1015,10 +1193,24 @@ void setup() {
 
   setRev(0);
 
-  // Carica pattern da SD + calcola durate tracce
+  // --- Carica pattern / fill / song da SD --------------------------
   leggiSd();
   bpmToTime(bpm);
 
+  // Inizializza il blocco corrente (A del pattern 0) così se arriva
+  // subito un play trova curBlock[] valido.
+  playMode    = 0;
+  curSection  = preSection = 0;
+  ptnNum      = prePtnNum  = 0;
+  fillNum     = preFillNum = 0;
+  playingFill = false;
+  fillPending = false;
+  songNum     = 0;
+  songPos     = 0;
+  curSubStep  = 0;
+  setCurrentBlock(0, 0);
+
+  // Calcola durate tracce SD WAV
   for (int i = 0; i < trackMaxNum; i++) {
     delay(50);
     playSdWav.play(trackSdArr[i]);
@@ -1045,11 +1237,10 @@ void loop() {
 
   // SD track play (sync == 1)
   if (togSdWave == 0 && sync == 1 && seqRunning == 1) {
-    kitNum = trackKitArr[trackSdNum];
+    kitNum    = trackKitArr[trackSdNum];
     preKitNum = kitNum;
-    fillNum = trackFillArr[trackSdNum];
     togSdWave = 1;
-    step = 0;
+    curSubStep = 0;
     if (track2exist == 1) playSdWav2.play(trackSdBArr[trackSdNum]);
     playSdWav.play(trackSdArr[trackSdNum]);
     delay(2);
@@ -1069,8 +1260,7 @@ void loop() {
       togPeak = 0;
       if (trigMsecs > 30) {
         if (autoStepZero == 1) {
-          if (step != 0 && step < 16) step = 0;
-          if (step >= 16 && step != 16) step = 16;
+          if (curSubStep != 0) curSubStep = 0;
         }
       }
       trigMsecs = 0;

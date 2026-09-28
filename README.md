@@ -1,6 +1,6 @@
 # Lud-WS-Teensy
 
-v 0.1.10
+v 0.1.12
 
 				mcu: Teensy 4.1 
 
