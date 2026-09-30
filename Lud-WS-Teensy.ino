@@ -697,8 +697,8 @@ void seqRun() {
   // Voce 4 — HH2
   if (curBlock[4][curSubStep] > 0 && hh2Mute == 0) {
     setVel(ampHH2, curBlock[4][curSubStep]);
-    numR = random(1, hhArrSize[kitArr[4][kitNum - 1]]);
-    soundHh2.play(hhArr[kitArr[4][kitNum - 1]][numR - 1]);
+    numR = random(1, hh2ArrSize[kitArr[4][kitNum - 1]]);
+    soundHh2.play(hh2Arr[kitArr[4][kitNum - 1]][numR - 1]);
   }
 
   // Voce 5 — CLAP
