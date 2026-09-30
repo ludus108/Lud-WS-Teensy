@@ -131,32 +131,35 @@ const char* LUDHHarr[6] = {"HH1.raw", "HH2.raw", "HH3.raw", "HH4.raw", "HH5.raw"
 //const char* MARKRIarr[8] = {"MARKRI1.raw", "MARKRI2.raw", "MARKR3.raw", "MARKRI4.raw", "MARKRI5.raw", "MARKRI6.raw", "MARKRI7.raw", "MARKRI8.raw"};
 //const char* MAR909Aarr[6] = {"MAR909A1.raw", "MAR909A2.raw", "MARKR3.raw", "MAR909A4.raw", "MAR909A5.raw", "MAR909A6.raw"};
 
-
+// 1 BD
 const char** bdArr[12] = {LUDBD, BDBAN, BDMOS1, BDMOS2, BDLINNarr, BD808arr, BD808Larr, CR78BDarr, CR77BD, TR76BDarr, MPOPBDarr, HAMBDarr};
 const int bdArrSize[12] = {LUDBDs, BDBANs, BDMOS1s, BDMOS2s, BDLINNarrs, BD808arrs, BD808Larrs, CR78BDarrs, CR77BDs, TR76BDarrs, MPOPBDarrs, HAMBDarrs};
-
+// 2 SD
 const char** sdArr[12] = {LUDSD, SDKRIarr, SD808arr, SD808Barr, SDLINNarr, MPOPSDarr, TR76SDarr, CR78SDarr, SIMMSDarr, HAMSDAarr, HAMSDBarr, SIMMRIMarr};
 const int sdArrSize[12] = {LUDSDs, SDKRIarrs, SD808arrs, SD808Barrs, SDLINNarrs, MPOPSDarrs, TR76SDarrs, CR78SDarrs, SIMMSDarrs, HAMSDAarrs, HAMSDBarrs, SIMMRIMarrs};
-
+// 3 HH
 const char** hhArr[14] = {LUDHHarr, HHLINNarr, LINNHHB, CH808arr, MPOPHHarr, HAMHHarr, TR76HHarr, CR77HHarr, CR78HHarr, MAR808arr, CABLINNarr, CYM808Aarr, CYM808Barr, RIDLINNarr};
 const int hhArrSize[14] = {LUDHHarrs, HHLINNarrs, LINNHHBs, CH808arrs, MPOPHHarrs, HAMHHarrs, TR76HHarrs, CR77HHarrs, CR78HHarrs, MAR808arrs, CABLINNarrs, CYM808Aarrs, CYM808Barrs, RIDLINNarrs};
-
+// 4 OH
 const char** ohArr[11] = {LUDOH, OHKRIarr, OH808arr, OH808Barr, OH909Aarr, OHLINNarr, OHBLINNarr, MPOPHOarr, HAMHOBarr, TR76HOarr, CR78HOarr};
 const int ohArrSize[11] = {LUDOHs, OHKRIarrs, OH808arrs, OH808Barrs, OH909Aarrs, OHLINNarrs, OHBLINNarrs, MPOPHOarrs, HAMHOBarrs, TR76HOarrs, CR78HOarrs};
-
+// 5 HH2
+const char** hh2Arr[14] = {LUDHHarr, HHLINNarr, LINNHHB, CH808arr, MPOPHHarr, HAMHHarr, TR76HHarr, CR77HHarr, CR78HHarr, MAR808arr, CABLINNarr, CYM808Aarr, CYM808Barr, RIDLINNarr};
+const int hhArrSize[14] = {LUDHHarrs, HHLINNarrs, LINNHHBs, CH808arrs, MPOPHHarrs, HAMHHarrs, TR76HHarrs, CR77HHarrs, CR78HHarrs, MAR808arrs, CABLINNarrs, CYM808Aarrs, CYM808Barrs, RIDLINNarrs};
+// 6 CLAP
 const char** clapArr[5] = {KANOarr, KANOBRarr, KANOBLarr, CLAPLINNarr, CLAP808arr};
 const int clapArrSize[5] = {KANOarrs, KANOBRarrs, KANOBLarrs, CLAPLINNarrs, CLAP808arrs};
-
+// 7 PERC 1
 const char** perc1Arr[12] = {LC808Aarr, LC808Barr, LC808Carr, LC808Darr, LT808Aarr, LT808Barr, TOMLINNarr, SIMMLTarr, CONGLLINNarr, MPOMXLarr, TR76PER1Carr, CR78RIMarr};
 const int perc1ArrSize[12] = {LC808Aarrs, LC808Barrs, LC808Carrs, LC808Darrs, LT808Aarrs, LT808Barrs, TOMLINNarrs, SIMMLTarrs, CONGLLINNarrs, MPOMXLarrs, TR76PER1Carrs, CR78RIMarrs};
-
+// 8 PERC 2
 const char** perc2Arr[13] = {MC808Aarr, MC808Barr, MC808Carr, MT808Aarr, MT808Barr, MT808Carr, SIMMMTarr, CONGMLINNarr, BNGLINNarr, MPOPCONarr, TR76PER2Carr, CR78BLO1arr, CR78GUIarr};
 const int perc2ArrSize[13] = {MC808Aarrs, MC808Barrs, MC808Carrs, MT808Aarrs, MT808Barrs, MT808Carrs, SIMMMTarrs, CONGMLINNarrs, BNGLINNarrs, MPOPCONarrs, TR76PER2Carrs, CR78BLO1arrs, CR78GUIarrs};
-
+// 9 PERC 3
 const char** perc3Arr[13] = {HCA808arr, HCB808arr, HCC808arr, HCD808arr, HCE808arr, HT808Aarr, HT808Barr, SIMMHTarr, CONGHLINNarr, MPOPCLarr, TR76PER3Carr, CR78BLO2arr, CR78COWarr};
 const int perc3ArrSize[13] = {HCA808arrs, HCB808arrs, HCC808arrs, HCD808arrs, HCE808arrs, HT808Aarrs, HT808Barrs, SIMMHTarrs, CONGHLINNarrs, MPOPCLarrs, TR76PER3Carrs, CR78BLO2arrs, CR78COWarrs};
-int maxArr[9] = {11, 11, 13, 10, 13, 4, 11, 12, 12};
-/*KITS:
+int maxArr[9] = {11, 11, 13, 10, 13, 4, 11, 12, 12}; // lunghezza di ogni Kit -1
+/* nomi KITS:
   1 = Lud1
   2 = Lud2
   3 = Lud3

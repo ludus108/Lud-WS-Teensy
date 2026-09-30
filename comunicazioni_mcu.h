@@ -135,7 +135,7 @@ static void lws_send_param(char target, char key, uint8_t value) {
     lws_send_frame(LWS_SERIAL, MCU_ID, lws_next_seq(), CMD_PARAM, p, 3);
 }
 
-static void lws_send_param_reliable(char target, char key, uint8_t value) {
+[[maybe_unused]] static void lws_send_param_reliable(char target, char key, uint8_t value) {
     uint8_t p[3] = { (uint8_t)target, (uint8_t)key, value };
     uint8_t seq  = lws_next_seq();
 
@@ -155,7 +155,7 @@ static void lws_send_param_reliable(char target, char key, uint8_t value) {
     lws_send_frame(LWS_SERIAL, MCU_ID, seq, CMD_PARAM_REL, p, 3);
 }
 
-static void lws_send_error(const char *msg) {
+[[maybe_unused]] static void lws_send_error(const char *msg) {
     uint8_t p[64];
     size_t l = strlen(msg);
     if (l > 62) l = 62;
